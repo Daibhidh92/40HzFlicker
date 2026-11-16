@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>40Hz picture frame room (Quest 3, WebXR)</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  .warn { background: #5a1d1d; padding: .75rem; border-radius: 6px; }
+  .ver { color: #888; font-size: .9rem; }
+  label, button { display: block; margin: 1rem 0; font-size: 1.2rem; }
+  input { font-size: 1.2rem; width: 6rem; }
+  button { padding: .8rem 1.6rem; }
+  pre { background: #222; padding: .75rem; border-radius: 6px; white-space: pre-wrap; }
+  #preview { width: 100%; height: 320px; border-radius: 6px; overflow: hidden; background: #000; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<h1>40Hz picture frame room</h1>
+<p class="ver">Room version 1</p>
+<p class="warn">Warning: flashing light. Not for anyone with a history of photosensitive epilepsy or seizures.</p>
+<p>A simple room. Only the picture on the far wall flickers. In the headset the picture is grey while the frame rate
+is set and checked (usually 1 to 3 seconds, up to 10 the first time), then flickers black/white at 40Hz.
+If the picture turns <b>solid red</b>, the headset did not reach 80Hz and no flicker is shown.
+Press the Meta button to exit early.</p>
+
+<div id="preview"></div>
+<p id="size" class="ver"></p>
+
+<label>Duration (seconds) <input id="dur" type="number" value="60" min="1"></label>
+<button id="go" disabled>Checking for WebXR...</button>
+<pre id="log"></pre>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ---------- Settings ----------
+const TARGET_HZ = 80;               // headset refresh rate we ask for
+const FRAME_MS  = 1000 / TARGET_HZ; // 12.5 ms per frame
+const CHECK_MS  = 1000;             // length of each frame-rate check window
+const MAX_CHECK_MS = 8000;          // keep re-checking for up to 8 s before showing red
+const TOLERANCE_HZ = 2;             // how far off 80Hz we accept
+const RATE_WAIT_MS = 2000;          // give up waiting for the rate change after this
+
+const PIC_W = 1.0, PIC_H = 0.75;    // flickering picture size in metres
+const PIC_Y = 1.55;                 // height of picture centre from floor (m)
+const BACK_WALL_Z = -3.0;           // far wall is 3 m in front of the start point
+
+const btn = document.getElementById('go');
+const logEl = document.getElementById('log');
+const log = m => { logEl.textContent += m + '\n'; };
+
+// Visual angle when viewed straight on from the start point
+const dist = Math.abs(BACK_WALL_Z);
+const degW = 2 * Math.atan(PIC_W / 2 / dist) * 180 / Math.PI;
+const degH = 2 * Math.atan(PIC_H / 2 / dist) * 180 / Math.PI;
+document.getElementById('size').textContent =
+  `Picture: ${PIC_W} x ${PIC_H} m, ${dist} m from the start point, about ${degW.toFixed(1)}° x ${degH.toFixed(1)}° of visual angle viewed straight on.`;
+
+// ---------- Renderer and preview ----------
+const holder = document.getElementById('preview');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(holder.clientWidth, holder.clientHeight);
+renderer.xr.enabled = true;
+holder.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202020);
+const camera = new THREE.PerspectiveCamera(70, holder.clientWidth / holder.clientHeight, 0.05, 50);
+camera.position.set(0, 1.6, 1.2);
+camera.lookAt(0, 1.45, BACK_WALL_Z);
+
+// ---------- Lights ----------
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const sun = new THREE.DirectionalLight(0xfff4e5, 1.6);
+sun.position.set(1.5, 3, 2);
+scene.add(sun);
+
+// ---------- Room ----------
+const lambert = c => new THREE.MeshLambertMaterial({ color: c });
+
+// Walls and ceiling: one box seen from the inside. Room is 5 m wide, 5 m deep, 2.7 m high.
+const room = new THREE.Mesh(
+  new THREE.BoxGeometry(5, 2.7, 5),
+  new THREE.MeshLambertMaterial({ color: 0xe8e0d0, side: THREE.BackSide })
+);
+room.position.set(0, 1.35, BACK_WALL_Z + 2.5);
+scene.add(room);
+
+// Floor
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(5, 5), lambert(0x8a6a4a));
+floor.rotation.x = -Math.PI / 2;
+floor.position.set(0, 0.001, BACK_WALL_Z + 2.5);
+scene.add(floor);
+
+// Rug
+const rug = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 1.5), lambert(0x6b3b3b));
+rug.rotation.x = -Math.PI / 2;
+rug.position.set(0, 0.003, -1.2);
+scene.add(rug);
+
+// Table with four legs
+const table = new THREE.Group();
+const top = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.05, 0.7), lambert(0x5a3e2b));
+top.position.y = 0.72;
+table.add(top);
+for (const [x, z] of [[-0.55, -0.3], [0.55, -0.3], [-0.55, 0.3], [0.55, 0.3]]) {
+  const leg = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.7, 0.05), lambert(0x4a3222));
+  leg.position.set(x, 0.35, z);
+  table.add(leg);
+}
+table.position.set(1.6, 0, -1.6);
+scene.add(table);
+
+// Window on the left wall (static, does not flicker)
+const windowPane = new THREE.Mesh(
+  new THREE.PlaneGeometry(1.2, 1.0),
+  new THREE.MeshBasicMaterial({ color: 0xa8c8e8 })
+);
+windowPane.rotation.y = Math.PI / 2;
+windowPane.position.set(-2.49, 1.5, -1.2);
+scene.add(windowPane);
+
+// Picture frame on the far wall
+const frame = new THREE.Mesh(new THREE.BoxGeometry(PIC_W + 0.16, PIC_H + 0.16, 0.05), lambert(0x3b2a1e));
+frame.position.set(0, PIC_Y, BACK_WALL_Z + 0.025);
+scene.add(frame);
+
+// The flickering picture. Unlit material so white is true white and black is true black.
+const picMat = new THREE.MeshBasicMaterial({ color: 0x4d4d4d, toneMapped: false });
+const picture = new THREE.Mesh(new THREE.PlaneGeometry(PIC_W, PIC_H), picMat);
+picture.position.set(0, PIC_Y, BACK_WALL_Z + 0.055);
+scene.add(picture);
+
+function renderPreview() {
+  picMat.color.setScalar(0.3);
+  renderer.setSize(holder.clientWidth, holder.clientHeight);
+  camera.aspect = holder.clientWidth / holder.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.render(scene, camera);
+}
+renderPreview();
+window.addEventListener('resize', () => { if (!renderer.xr.isPresenting) renderPreview(); });
+
+// ---------- WebXR availability ----------
+if (!navigator.xr) {
+  btn.textContent = 'WebXR not available';
+  log('Open this page in the Meta Quest browser (over https).');
+} else {
+  navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+    if (ok) { btn.disabled = false; btn.textContent = 'Enter VR'; }
+    else { btn.textContent = 'VR not supported here'; }
+  });
+}
+
+// ---------- Session state ----------
+let session = null, duration = 60000;
+let phase, phaseStart, last, rateReady, checkStart, checkCount;
+let checkIntervals, runIntervals, dropped, onFrames, offFrames;
+
+function resetState() {
+  phase = 'wait'; phaseStart = null; last = null; rateReady = false;
+  checkStart = null; checkCount = 0;
+  checkIntervals = []; runIntervals = []; dropped = 0; onFrames = 0; offFrames = 0;
+}
+
+// ---------- Frame loop ----------
+function onFrame(t) {
+  if (!renderer.xr.isPresenting) return;
+
+  if (phase === 'wait') {
+    picMat.color.setScalar(0.3);
+    if (rateReady) { phase = 'check'; phaseStart = t; last = null; }
+  } else {
+    const dt = last === null ? null : t - last;
+    last = t;
+
+    if (phase === 'check') {
+      if (checkStart === null) checkStart = t;
+      if (dt !== null) checkIntervals.push(dt);
+      picMat.color.setScalar(0.3);
+      if (t - phaseStart >= CHECK_MS && checkIntervals.length) {
+        const meanMs = checkIntervals.reduce((a, b) => a + b, 0) / checkIntervals.length;
+        const hz = 1000 / meanMs;
+        checkCount++;
+        log('Check ' + checkCount + ': ' + hz.toFixed(2) + 'Hz');
+        if (Math.abs(hz - TARGET_HZ) <= TOLERANCE_HZ) {
+          phase = 'run';
+        } else if (t - checkStart >= MAX_CHECK_MS) {
+          phase = 'fail';
+          log('FAIL: headset did not reach 80Hz, flicker not shown.');
+        } else {
+          checkIntervals = [];
+        }
+        phaseStart = t; last = null;
+      }
+    } else if (phase === 'fail') {
+      picMat.color.setRGB(0.6, 0, 0);
+      if (t - phaseStart >= 3000) session.end();
+    } else if (phase === 'run') {
+      // White/black is set by the clock, not a frame counter,
+      // so a dropped frame doesn't shift the 40Hz rhythm.
+      if (dt !== null) {
+        runIntervals.push(dt);
+        if (dt > FRAME_MS * 1.5) dropped += Math.round(dt / FRAME_MS) - 1;
+      }
+      const n = Math.round((t - phaseStart) / FRAME_MS);
+      const on = n % 2 === 0;
+      on ? onFrames++ : offFrames++;
+      picMat.color.setScalar(on ? 1 : 0);
+      if (t - phaseStart >= duration) session.end();
+    }
+  }
+  renderer.render(scene, camera);
+}
+
+// ---------- Start ----------
+btn.onclick = async () => {
+  logEl.textContent = '';
+  try {
+    duration = Number(document.getElementById('dur').value) * 1000;
+    session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] });
+    resetState();
+
+    session.addEventListener('end', () => {
+      renderer.setAnimationLoop(null);
+      log('Session ended.');
+      if (runIntervals.length) {
+        const meanMs = runIntervals.reduce((a, b) => a + b, 0) / runIntervals.length;
+        const hz = 1000 / meanMs;
+        log('--- Run summary ---');
+        log('Frames: ' + (onFrames + offFrames) + ' (white ' + onFrames + ', black ' + offFrames + ')');
+        log('Mean refresh: ' + hz.toFixed(2) + 'Hz  ->  flicker ' + (hz / 2).toFixed(2) + 'Hz');
+        log('Dropped frames: ' + dropped);
+        log(dropped === 0 ? 'OK: clean 40Hz run.' : 'Check: some frames dropped, see count above.');
+      }
+      session = null;
+      setTimeout(renderPreview, 100);
+    });
+
+    // Start drawing straight away so the headset leaves the loading screen
+    renderer.xr.setReferenceSpaceType('local-floor');
+    renderer.setAnimationLoop(onFrame);
+    await renderer.xr.setSession(session);
+
+    // Then ask for 80Hz without blocking the frame loop
+    const rates = session.supportedFrameRates ? Array.from(session.supportedFrameRates) : [];
+    log('Supported refresh rates: ' + (rates.length ? rates.join(', ') : 'not reported'));
+    if (session.updateTargetFrameRate && rates.includes(TARGET_HZ)) {
+      session.updateTargetFrameRate(TARGET_HZ)
+        .then(() => log('Requested 80Hz.'))
+        .catch(e => log('Could not set 80Hz: ' + e))
+        .finally(() => { rateReady = true; });
+      setTimeout(() => { rateReady = true; }, RATE_WAIT_MS);
+    } else {
+      log('This browser cannot set the refresh rate from the page.');
+      rateReady = true;
+    }
+  } catch (e) {
+    log('Error: ' + (e && e.message ? e.message : e));
+    if (session) { try { session.end(); } catch (_) {} }
+  }
+};
+</script>
+</body>
+</html>
