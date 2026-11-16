@@ -7,6 +7,7 @@
 <style>
   body { font-family: system-ui, sans-serif; background: #111; color: #eee; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
   .warn { background: #5a1d1d; padding: .75rem; border-radius: 6px; }
+  .ver { color: #888; font-size: .9rem; }
   label, button { display: block; margin: 1rem 0; font-size: 1.2rem; }
   input { font-size: 1.2rem; width: 6rem; }
   button { padding: .8rem 1.6rem; }
@@ -15,8 +16,9 @@
 </head>
 <body>
 <h1>40Hz flicker test</h1>
+<p class="ver">Version 2</p>
 <p class="warn">Warning: flashing light. Not for anyone with a history of photosensitive epilepsy or seizures.</p>
-<p>In the headset: first 1 second is dim grey while the frame rate is checked.
+<p>In the headset: dim grey first while the frame rate is set and checked (about 1 to 2 seconds).
 Then it flickers black/white at 40Hz. If it turns <b>solid red</b>, the headset is not running at 80Hz and no flicker is shown.
 Press the Meta button to exit early.</p>
 
@@ -25,10 +27,11 @@ Press the Meta button to exit early.</p>
 <pre id="log"></pre>
 
 <script>
-const TARGET_HZ = 80;              // headset refresh rate we ask for
+const TARGET_HZ = 80;               // headset refresh rate we ask for
 const FRAME_MS  = 1000 / TARGET_HZ; // 12.5 ms per frame
-const CHECK_MS  = 1000;            // grey check period before flicker starts
-const TOLERANCE_HZ = 2;            // how far off 80Hz we accept
+const CHECK_MS  = 1000;             // grey check period before flicker starts
+const TOLERANCE_HZ = 2;             // how far off 80Hz we accept
+const RATE_WAIT_MS = 2000;          // give up waiting for the rate change after this
 
 const btn = document.getElementById('go');
 const logEl = document.getElementById('log');
@@ -46,87 +49,109 @@ if (!navigator.xr) {
 
 btn.onclick = async () => {
   logEl.textContent = '';
-  const duration = Number(document.getElementById('dur').value) * 1000;
-  const session = await navigator.xr.requestSession('immersive-vr');
+  let session;
+  try {
+    const duration = Number(document.getElementById('dur').value) * 1000;
+    session = await navigator.xr.requestSession('immersive-vr');
 
-  // WebGL set up so we can paint the whole view one colour
-  const canvas = document.createElement('canvas');
-  const gl = canvas.getContext('webgl', { xrCompatible: true, antialias: false });
-  session.updateRenderState({
-    baseLayer: new XRWebGLLayer(session, gl, { antialias: false, depth: false })
-  });
+    // WebGL set up so we can paint the whole view one colour
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl', { xrCompatible: true, antialias: false });
+    await gl.makeXRCompatible();
+    session.updateRenderState({
+      baseLayer: new XRWebGLLayer(session, gl, { antialias: false, depth: false })
+    });
+    const refSpace = await session.requestReferenceSpace('local');
 
-  // Ask the headset for 80Hz
-  const rates = session.supportedFrameRates ? Array.from(session.supportedFrameRates) : [];
-  log('Supported refresh rates: ' + (rates.length ? rates.join(', ') : 'not reported'));
-  if (session.updateTargetFrameRate && rates.includes(TARGET_HZ)) {
-    try { await session.updateTargetFrameRate(TARGET_HZ); }
-    catch (e) { log('Could not set 80Hz: ' + e); }
-  } else {
-    log('This browser cannot set the refresh rate from the page.');
-  }
-  log('Headset reports: ' + (session.frameRate ?? 'unknown') + 'Hz');
-
-  // Frame loop state
-  let start = null, last = null, phase = 'check', flickerStart = null;
-  let checkIntervals = [], runIntervals = [], dropped = 0, onFrames = 0, offFrames = 0;
-
-  function paint(r, g, b) {
-    gl.bindFramebuffer(gl.FRAMEBUFFER, session.renderState.baseLayer.framebuffer);
-    gl.clearColor(r, g, b, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-  }
-
-  function onFrame(t, xrFrame) {
-    if (start === null) start = t;
-    const dt = last === null ? null : t - last;
-    last = t;
-
-    if (phase === 'check') {
-      if (dt !== null) checkIntervals.push(dt);
-      paint(0.2, 0.2, 0.2);
-      if (t - start >= CHECK_MS) {
-        const meanMs = checkIntervals.reduce((a, b) => a + b, 0) / checkIntervals.length;
-        const hz = 1000 / meanMs;
-        log('Measured during check: ' + hz.toFixed(2) + 'Hz');
-        if (Math.abs(hz - TARGET_HZ) <= TOLERANCE_HZ) {
-          phase = 'run'; flickerStart = t;
-        } else {
-          phase = 'fail'; flickerStart = t;
-          log('FAIL: not running at 80Hz, flicker not shown.');
-        }
-      }
-    } else if (phase === 'fail') {
-      paint(0.6, 0, 0);
-      if (t - flickerStart >= 3000) { session.end(); return; }
-    } else {
-      // Run: decide white/black from the clock, not a frame counter,
-      // so a dropped frame doesn't shift the 40Hz rhythm.
-      if (dt !== null) {
-        runIntervals.push(dt);
-        if (dt > FRAME_MS * 1.5) dropped += Math.round(dt / FRAME_MS) - 1;
-      }
-      const n = Math.round((t - flickerStart) / FRAME_MS);
-      const on = n % 2 === 0;
-      on ? onFrames++ : offFrames++;
-      paint(on ? 1 : 0, on ? 1 : 0, on ? 1 : 0);
-      if (t - flickerStart >= duration) { session.end(); return; }
+    function paint(r, g, b) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, session.renderState.baseLayer.framebuffer);
+      gl.clearColor(r, g, b, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
     }
+
+    // Phases: wait (rate being set) -> check (measure) -> run (flicker) or fail (red)
+    let phase = 'wait', phaseStart = null, last = null;
+    let rateReady = false;
+    let checkIntervals = [], runIntervals = [], dropped = 0, onFrames = 0, offFrames = 0;
+
+    function onFrame(t, xrFrame) {
+      session.requestAnimationFrame(onFrame); // keep the loop going first
+      xrFrame.getViewerPose(refSpace);        // keeps the headset happy; pose not needed
+
+      if (phase === 'wait') {
+        paint(0.2, 0.2, 0.2);
+        if (rateReady) { phase = 'check'; phaseStart = t; last = null; }
+        return;
+      }
+
+      const dt = last === null ? null : t - last;
+      last = t;
+
+      if (phase === 'check') {
+        if (dt !== null) checkIntervals.push(dt);
+        paint(0.2, 0.2, 0.2);
+        if (t - phaseStart >= CHECK_MS && checkIntervals.length) {
+          const meanMs = checkIntervals.reduce((a, b) => a + b, 0) / checkIntervals.length;
+          const hz = 1000 / meanMs;
+          log('Measured during check: ' + hz.toFixed(2) + 'Hz');
+          if (Math.abs(hz - TARGET_HZ) <= TOLERANCE_HZ) {
+            phase = 'run';
+          } else {
+            phase = 'fail';
+            log('FAIL: not running at 80Hz, flicker not shown.');
+          }
+          phaseStart = t; last = null;
+        }
+      } else if (phase === 'fail') {
+        paint(0.6, 0, 0);
+        if (t - phaseStart >= 3000) session.end();
+      } else if (phase === 'run') {
+        // White/black is set by the clock, not a frame counter,
+        // so a dropped frame doesn't shift the 40Hz rhythm.
+        if (dt !== null) {
+          runIntervals.push(dt);
+          if (dt > FRAME_MS * 1.5) dropped += Math.round(dt / FRAME_MS) - 1;
+        }
+        const n = Math.round((t - phaseStart) / FRAME_MS);
+        const on = n % 2 === 0;
+        on ? onFrames++ : offFrames++;
+        paint(on ? 1 : 0, on ? 1 : 0, on ? 1 : 0);
+        if (t - phaseStart >= duration) session.end();
+      }
+    }
+
+    session.addEventListener('end', () => {
+      log('Session ended.');
+      if (!runIntervals.length) return;
+      const meanMs = runIntervals.reduce((a, b) => a + b, 0) / runIntervals.length;
+      const hz = 1000 / meanMs;
+      log('--- Run summary ---');
+      log('Frames: ' + (onFrames + offFrames) + ' (white ' + onFrames + ', black ' + offFrames + ')');
+      log('Mean refresh: ' + hz.toFixed(2) + 'Hz  ->  flicker ' + (hz / 2).toFixed(2) + 'Hz');
+      log('Dropped frames: ' + dropped);
+      log(dropped === 0 ? 'OK: clean 40Hz run.' : 'Check: some frames dropped, see count above.');
+    });
+
+    // Start drawing straight away so the headset leaves the loading screen
     session.requestAnimationFrame(onFrame);
+
+    // Then ask for 80Hz without blocking the frame loop
+    const rates = session.supportedFrameRates ? Array.from(session.supportedFrameRates) : [];
+    log('Supported refresh rates: ' + (rates.length ? rates.join(', ') : 'not reported'));
+    if (session.updateTargetFrameRate && rates.includes(TARGET_HZ)) {
+      session.updateTargetFrameRate(TARGET_HZ)
+        .then(() => log('Requested 80Hz. Headset reports: ' + session.frameRate + 'Hz'))
+        .catch(e => log('Could not set 80Hz: ' + e))
+        .finally(() => { rateReady = true; });
+      setTimeout(() => { rateReady = true; }, RATE_WAIT_MS);
+    } else {
+      log('This browser cannot set the refresh rate from the page.');
+      rateReady = true;
+    }
+  } catch (e) {
+    log('Error: ' + (e && e.message ? e.message : e));
+    if (session) { try { session.end(); } catch (_) {} }
   }
-
-  session.addEventListener('end', () => {
-    if (!runIntervals.length) return;
-    const meanMs = runIntervals.reduce((a, b) => a + b, 0) / runIntervals.length;
-    const hz = 1000 / meanMs;
-    log('--- Run summary ---');
-    log('Frames: ' + (onFrames + offFrames) + ' (white ' + onFrames + ', black ' + offFrames + ')');
-    log('Mean refresh: ' + hz.toFixed(2) + 'Hz  ->  flicker ' + (hz / 2).toFixed(2) + 'Hz');
-    log('Dropped frames: ' + dropped);
-    log(dropped === 0 ? 'OK: clean 40Hz run.' : 'Check: some frames dropped, see count above.');
-  });
-
-  session.requestAnimationFrame(onFrame);
 };
 </script>
 </body>
